@@ -233,18 +233,22 @@ def ask_database(user_query: str, retries: int = 1, allowed_tables: set | None =
     tables = allowed_tables if allowed_tables is not None else ALLOWED_TABLES
     
     # Get schema info for the selected tables
-    if allowed_tables is not None:
-        # Generate schema info dynamically for selected tables
+    try:
         current_schema_info = get_schema_info(engine, tables)
-    else:
-        current_schema_info = schema_info
+    except Exception as e:
+        return {
+            "question": user_query,
+            "sql": None,
+            "result": None,
+            "answer": f"Sorry, could not retrieve schema information: {str(e)}",
+        }
     
     if current_schema_info is None or current_schema_info == "":
         return {
             "question": user_query,
             "sql": None,
             "result": None,
-            "answer": "Sorry, schema information is not available. Please select tables first.",
+            "answer": "Sorry, schema information is not available. Please check your database connection.",
         }
 
     last_error = None

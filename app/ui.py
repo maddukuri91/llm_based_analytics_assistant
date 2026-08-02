@@ -152,8 +152,9 @@ if submitted and user_query.strip() and st.session_state.engine and st.session_s
     st.session_state.messages.append({"role": "user", "content": user_query})
     
     try:
-        # Get schema info for selected tables only
+        # Get schema info for selected tables only and store in session state
         schema_info = get_schema_info(st.session_state.engine, set(st.session_state.selected_tables))
+        st.session_state.schema_info = schema_info
         
         # Get response from backend with selected tables
         with st.spinner("Generating SQL and querying the database..."):
