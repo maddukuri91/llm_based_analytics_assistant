@@ -16,6 +16,8 @@ langchain-ollama>=0.1.0
 
 # UI
 streamlit>=1.30.0
+plotly>=5.18.0
+graphviz>=0.20.0
 
 # Data
 pandas>=2.0.0

@@ -8,8 +8,51 @@ import os
 import sys
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, inspect
+
+try:
+    import graphviz
+except ImportError:
+    graphviz = None
+
+
+def create_er_diagram(engine, selected_tables):
+    """Create an ER diagram using graphviz"""
+    if not graphviz:
+        return None
+    
+    inspector = inspect(engine)
+    dot = graphviz.Digraph(comment='Database Schema')
+    dot.attr(rankdir='LR', size='12,8')
+    dot.attr('node', shape='record', style='filled', fillcolor='lightblue')
+    
+    # Add tables as nodes
+    for table in selected_tables:
+        columns = inspector.get_columns(table)
+        col_str = "{" + table + "|"
+        for i, col in enumerate(columns):
+            col_type = str(col['type'])
+            col_str += f"{col['name']} : {col_type}\\l"
+        col_str += "}"
+        dot.node(table, label=col_str)
+    
+    # Add foreign key relationships as edges
+    for table in selected_tables:
+        fks = inspector.get_foreign_keys(table)
+        for fk in fks:
+            referred_table = fk['referred_table']
+            if referred_table in selected_tables:
+                constrained = fk['constrained_columns']
+                referred = fk['referred_columns']
+                dot.edge(
+                    f"{table}:{constrained[0]}",
+                    f"{referred_table}:{referred[0]}",
+                    style='dashed'
+                )
+    
+    return dot
 
 # Ensure the project root is on the path so `app.backend` can be imported
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -88,13 +131,40 @@ if st.session_state.available_tables:
     available_default = [t for t in st.session_state.available_tables if t in default_tables]
     
     if available_default:
+        # Add "All" option at the beginning
+        table_options = ["All"] + available_default
+        
+        # Determine default selection
+        if st.session_state.selected_tables == available_default or not st.session_state.selected_tables:
+            default_selection = ["All"] if not st.session_state.selected_tables else ["All"]
+        else:
+            default_selection = st.session_state.selected_tables
+        
         selected = st.sidebar.multiselect(
             "Available tables:",
-            options=available_default,
-            default=st.session_state.selected_tables,
-            help="Select the tables you want the LLM to be able to query"
+            options=table_options,
+            default=default_selection,
+            help="Select 'All' to query all tables, or select specific tables"
         )
-        st.session_state.selected_tables = selected
+        
+        # Handle "All" selection
+        if "All" in selected:
+            if len(selected) == 1:
+                # Only "All" is selected, use all available tables
+                st.session_state.selected_tables = available_default
+            else:
+                # "All" plus other tables selected - remove "All" and keep others
+                selected.remove("All")
+                st.session_state.selected_tables = selected
+        else:
+            st.session_state.selected_tables = selected
+        
+        # Load schema info when tables are selected
+        if st.session_state.selected_tables and st.session_state.engine:
+            try:
+                st.session_state.schema_info = get_schema_info(st.session_state.engine, set(st.session_state.selected_tables))
+            except Exception as e:
+                st.session_state.schema_info = f"Error loading schema: {str(e)}"
     else:
         st.sidebar.warning("No matching tables found in database")
 else:
@@ -143,8 +213,44 @@ for message in st.session_state.messages:
                     st.code(message["sql"], language="sql")
             st.write(message.get("content", message.get("answer", "")))
             if message.get("result") is not None and not message["result"].empty:
+                result_df = message["result"]
                 with st.expander("Query Results"):
-                    st.dataframe(message["result"])
+                    st.dataframe(result_df, use_container_width=True)
+                
+                # Add visualization section
+                with st.expander("📊 Visualize Data"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        chart_type = st.selectbox(
+                            "Chart Type",
+                            ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot", "Area Chart"],
+                            key=f"chart_type_{len(st.session_state.messages)}"
+                        )
+                    with col2:
+                        # Auto-suggest columns for axes
+                        numeric_cols = result_df.select_dtypes(include=['number']).columns.tolist()
+                        all_cols = result_df.columns.tolist()
+                        
+                        x_axis = st.selectbox("X Axis", all_cols, key=f"x_axis_{len(st.session_state.messages)}")
+                        y_axis = st.selectbox("Y Axis", numeric_cols if numeric_cols else all_cols, key=f"y_axis_{len(st.session_state.messages)}")
+                    
+                    # Generate chart based on selection
+                    try:
+                        if chart_type == "Bar Chart":
+                            fig = px.bar(result_df, x=x_axis, y=y_axis, title=f"{y_axis} by {x_axis}")
+                        elif chart_type == "Line Chart":
+                            fig = px.line(result_df, x=x_axis, y=y_axis, title=f"{y_axis} over {x_axis}")
+                        elif chart_type == "Pie Chart":
+                            fig = px.pie(result_df, names=x_axis, values=y_axis, title=f"{y_axis} by {x_axis}")
+                        elif chart_type == "Scatter Plot":
+                            fig = px.scatter(result_df, x=x_axis, y=y_axis, title=f"{y_axis} vs {x_axis}")
+                        elif chart_type == "Area Chart":
+                            fig = px.area(result_df, x=x_axis, y=y_axis, title=f"{y_axis} by {x_axis}")
+                        
+                        fig.update_layout(autosize=True, height=400)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Could not generate chart: {str(e)}")
 
 # Handle new submission
 if submitted and user_query.strip() and st.session_state.engine and st.session_state.selected_tables:
@@ -186,7 +292,17 @@ elif submitted and not user_query.strip():
 
 if st.session_state.schema_info:
     with st.expander("Database Schema"):
-        st.text(st.session_state.schema_info)
+        if graphviz and st.session_state.engine and st.session_state.selected_tables:
+            try:
+                er_diagram = create_er_diagram(st.session_state.engine, st.session_state.selected_tables)
+                if er_diagram:
+                    st.graphviz_chart(er_diagram)
+                else:
+                    st.info("Could not generate ER diagram")
+            except Exception as e:
+                st.error(f"Error generating ER diagram: {str(e)}")
+        else:
+            st.info("Install graphviz to view ER diagrams: pip install graphviz")
 elif st.session_state.engine:
     with st.expander("Database Schema"):
         st.info("Select tables to view schema")
