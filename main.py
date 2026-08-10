@@ -19,7 +19,7 @@ app = FastAPI(
 
 # Build the engine from environment variables (or defaults) at startup.
 DB_USER = os.getenv("DB_USER", "sql_agent")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Delhi@369")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "xxxxxxx")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_NAME = os.getenv("DB_NAME", "sakila")
