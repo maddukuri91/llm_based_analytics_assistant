@@ -23,10 +23,6 @@ from sqlalchemy import Engine, create_engine, inspect, text
 # Configuration
 # ---------------------------------------------------------------------------
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
 MAX_CLARIFICATION_ROUNDS = int(os.getenv("MAX_CLARIFICATION_ROUNDS", "3"))
 MAX_RESULT_ROWS_FOR_LLM = int(os.getenv("MAX_RESULT_ROWS_FOR_LLM", "200"))
 
@@ -68,18 +64,61 @@ def create_db_engine(
 # LLM
 # ---------------------------------------------------------------------------
 
-if LLM_PROVIDER == "groq":
-    from langchain_groq import ChatGroq
+def create_llm(
+    provider: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> Any:
+    """Create an LLM instance based on the provider and optional API key.
 
-    if not os.getenv("GROQ_API_KEY"):
-        raise RuntimeError("GROQ_API_KEY must be set when LLM_PROVIDER=groq.")
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0)
-elif LLM_PROVIDER == "ollama":
-    from langchain_ollama import ChatOllama
+    Supported providers: groq, openai, ollama.
+    - groq / openai require an API key (from argument or environment).
+    - ollama runs locally and does not need an API key.
+    """
+    provider = (provider or os.getenv("LLM_PROVIDER", "ollama")).lower().strip()
 
-    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0)
-else:
-    raise ValueError("LLM_PROVIDER must be either 'groq' or 'ollama'.")
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+
+        key = api_key or os.getenv("GROQ_API_KEY")
+        if not key:
+            raise ValueError("A Groq API key is required.")
+        return ChatGroq(
+            model=model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            api_key=key,
+            temperature=0,
+        )
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        key = api_key or os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise ValueError("An OpenAI API key is required.")
+        return ChatOpenAI(
+            model=model or os.getenv("OPENAI_MODEL", "gpt-4o"),
+            api_key=key,
+            temperature=0,
+        )
+
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=model or os.getenv("OLLAMA_MODEL", "qwen3:8b"),
+            temperature=0,
+        )
+
+    raise ValueError("LLM provider must be 'groq', 'openai', or 'ollama'.")
+
+
+def build_chains(llm: Any) -> dict[str, Any]:
+    """Build the clarification, SQL, and answer chains for a given LLM."""
+    return {
+        "clarification": clarification_prompt | llm,
+        "sql": sql_prompt | llm,
+        "answer": answer_prompt | llm,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +190,6 @@ JSON format:
 }}"""
 )
 
-clarification_chain = clarification_prompt | llm
-
 
 def _format_clarification_history(history: list[dict[str, str]]) -> str:
     if not history:
@@ -179,6 +216,7 @@ def _parse_json_object(raw_content: str) -> dict[str, Any]:
 def assess_clarity(
     original_question: str,
     schema_info: str,
+    clarification_chain: Any,
     clarification_history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     history = clarification_history or []
@@ -233,10 +271,8 @@ Resolved user request:
 SQL:"""
 )
 
-sql_chain = sql_prompt | llm
 
-
-def generate_sql(user_query: str, schema_info: str) -> str:
+def generate_sql(user_query: str, schema_info: str, sql_chain: Any) -> str:
     response = sql_chain.invoke(
         {
             "schema_info": schema_info,
@@ -335,10 +371,12 @@ Do not mention SQL, tables, schemas, or databases. If there are no rows, say
 that no matching information was found. Do not invent missing information."""
 )
 
-answer_chain = answer_prompt | llm
 
-
-def explain_results(user_query: str, dataframe: pd.DataFrame) -> str:
+def explain_results(
+    user_query: str,
+    dataframe: pd.DataFrame,
+    answer_chain: Any,
+) -> str:
     limited = dataframe.head(MAX_RESULT_ROWS_FOR_LLM)
     result_text = limited.to_string(index=False) if not limited.empty else "No rows returned."
     if len(dataframe) > len(limited):
@@ -378,6 +416,10 @@ def _response(
 def ask_database(
     user_query: str,
     db_engine: Engine,
+    llm: Any | None = None,
+    provider: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
     retries: int = 1,
     allowed_tables: set[str] | None = None,
     clarification_history: list[dict[str, str]] | None = None,
@@ -386,6 +428,9 @@ def ask_database(
 
     Each clarification history item must look like:
     {"question": "Question previously shown to the user", "answer": "User reply"}
+
+    Pass an ``llm`` instance explicitly, or provide ``provider``/``api_key``/
+    ``model`` to create one. If none are given, environment defaults are used.
     """
     user_query = user_query.strip()
     history = clarification_history or []
@@ -396,6 +441,18 @@ def ask_database(
             status="error",
             question=user_query,
             answer="Please enter a question.",
+        )
+
+    try:
+        active_llm = llm or create_llm(
+            provider=provider, api_key=api_key, model=model
+        )
+        chains = build_chains(active_llm)
+    except Exception as exc:
+        return _response(
+            status="error",
+            question=user_query,
+            answer=f"Could not initialise the LLM: {exc}",
         )
 
     try:
@@ -415,7 +472,12 @@ def ask_database(
         )
 
     try:
-        clarity = assess_clarity(user_query, current_schema_info, history)
+        clarity = assess_clarity(
+            user_query,
+            current_schema_info,
+            chains["clarification"],
+            history,
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         return _response(
             status="error",
@@ -453,10 +515,10 @@ def ask_database(
 
     for attempt in range(retries + 1):
         try:
-            sql = generate_sql(resolved_query, current_schema_info)
+            sql = generate_sql(resolved_query, current_schema_info, chains["sql"])
             validated_sql = validate_sql(sql, tables)
             dataframe = run_query(db_engine, validated_sql)
-            answer = explain_results(resolved_query, dataframe)
+            answer = explain_results(resolved_query, dataframe, chains["answer"])
             return _response(
                 status="complete",
                 question=user_query,
@@ -487,6 +549,7 @@ def continue_after_clarification(
     clarification_question: str,
     user_answer: str,
     db_engine: Engine,
+    llm: Any | None = None,
     **ask_options: Any,
 ) -> dict[str, Any]:
     """Convenience helper for submitting the user's next clarification reply."""
@@ -497,6 +560,7 @@ def continue_after_clarification(
     return ask_database(
         original_question,
         db_engine=db_engine,
+        llm=llm,
         clarification_history=updated_history,
         **ask_options,
     )

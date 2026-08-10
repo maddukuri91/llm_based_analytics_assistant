@@ -9,11 +9,11 @@ import os
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.backend import ask_database, create_db_engine
+from app.backend import ask_database, create_db_engine, create_llm
 
 app = FastAPI(
     title="LLM based Analytics Assistant",
-    description="Natural Language → SQL pipeline using LangChain + Llama 3.1 + MySQL",
+    description="Natural Language → SQL pipeline using LangChain + MySQL",
     version="1.0.0",
 )
 
@@ -25,6 +25,9 @@ DB_PORT = os.getenv("DB_PORT", "3306")
 DB_NAME = os.getenv("DB_NAME", "sakila")
 
 engine = create_db_engine(DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME)
+
+# Build the LLM from environment variables (or defaults) at startup.
+llm = create_llm()
 
 
 class QueryRequest(BaseModel):
@@ -53,7 +56,7 @@ def query(request: QueryRequest):
     Accept a natural-language question and return the generated SQL
     plus a natural-language answer.
     """
-    result = ask_database(request.question, db_engine=engine)
+    result = ask_database(request.question, db_engine=engine, llm=llm)
     return QueryResponse(
         question=result["question"],
         sql=result["sql"],

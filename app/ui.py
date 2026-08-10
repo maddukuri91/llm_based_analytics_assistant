@@ -68,6 +68,72 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Sidebar: LLM provider selection
+# ---------------------------------------------------------------------------
+
+st.sidebar.header("LLM Configuration")
+
+llm_provider = st.sidebar.selectbox(
+    "Select LLM Provider",
+    options=["Ollama", "Groq", "OpenAI"],
+    index=0,
+    help="Choose which LLM backend to use. Ollama runs locally; Groq and OpenAI require an API key.",
+)
+
+llm_model = ""
+
+if llm_provider == "Groq":
+    groq_api_key = st.sidebar.text_input(
+        "Groq API Key",
+        type="password",
+        placeholder="gsk_...",
+        help="Get a key at https://console.groq.com/keys",
+    )
+    llm_model = st.sidebar.selectbox(
+        "Model",
+        options=["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        index=0,
+        help="llama-3.3-70b-versatile is higher quality; llama-3.1-8b-instant is faster and lighter.",
+    )
+    if not groq_api_key:
+        st.sidebar.warning("Please enter your Groq API key.")
+elif llm_provider == "OpenAI":
+    openai_api_key = st.sidebar.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="Get a key at https://platform.openai.com/api-keys",
+    )
+    llm_model = st.sidebar.selectbox(
+        "Model",
+        options=["gpt-4o", "gpt-3.5-turbo"],
+        index=0,
+        help="gpt-4o is the latest flagship; gpt-3.5-turbo is lighter and faster.",
+    )
+    if not openai_api_key:
+        st.sidebar.warning("Please enter your OpenAI API key.")
+else:
+    llm_model = st.sidebar.text_input("Model", value="qwen3:8b")
+    st.sidebar.info("Ollama runs locally — no API key required.")
+
+# Store LLM config in session state
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = llm_provider
+if "llm_api_key" not in st.session_state:
+    st.session_state.llm_api_key = ""
+if "llm_model" not in st.session_state:
+    st.session_state.llm_model = llm_model
+
+st.session_state.llm_provider = llm_provider
+st.session_state.llm_model = llm_model
+if llm_provider == "Groq":
+    st.session_state.llm_api_key = groq_api_key
+elif llm_provider == "OpenAI":
+    st.session_state.llm_api_key = openai_api_key
+else:
+    st.session_state.llm_api_key = ""
+
+# ---------------------------------------------------------------------------
 # Sidebar: connection setup and table selection
 # ---------------------------------------------------------------------------
 
@@ -259,11 +325,18 @@ if submitted and user_query.strip() and st.session_state.engine and st.session_s
         schema_info = get_schema_info(st.session_state.engine, set(st.session_state.selected_tables))
         st.session_state.schema_info = schema_info
         
-        # Get response from backend with selected tables
+        # Validate API key requirement before calling backend
+        if st.session_state.llm_provider in ("Groq", "OpenAI") and not st.session_state.llm_api_key:
+            raise ValueError(f"Please enter your {st.session_state.llm_provider} API key.")
+        
+        # Get response from backend with selected tables and LLM config
         with st.spinner("Generating SQL and querying the database..."):
             result = ask_database(
                 user_query,
                 db_engine=st.session_state.engine,
+                provider=st.session_state.llm_provider.lower(),
+                api_key=st.session_state.llm_api_key or None,
+                model=st.session_state.llm_model or None,
                 allowed_tables=set(st.session_state.selected_tables),
             )
         
