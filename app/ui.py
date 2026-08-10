@@ -263,9 +263,11 @@ st.markdown(
 # Initialize chat history in session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pending_clarification" not in st.session_state:
+    st.session_state.pending_clarification = None
 
 # Display chat history
-for message in st.session_state.messages:
+for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         if message["role"] == "user":
             st.write(message["content"])
@@ -287,15 +289,15 @@ for message in st.session_state.messages:
                         chart_type = st.selectbox(
                             "Chart Type",
                             ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot", "Area Chart"],
-                            key=f"chart_type_{len(st.session_state.messages)}"
+                            key=f"chart_type_{i}"
                         )
                     with col2:
                         # Auto-suggest columns for axes
                         numeric_cols = result_df.select_dtypes(include=['number']).columns.tolist()
                         all_cols = result_df.columns.tolist()
                         
-                        x_axis = st.selectbox("X Axis", all_cols, key=f"x_axis_{len(st.session_state.messages)}")
-                        y_axis = st.selectbox("Y Axis", numeric_cols if numeric_cols else all_cols, key=f"y_axis_{len(st.session_state.messages)}")
+                        x_axis = st.selectbox("X Axis", all_cols, key=f"x_axis_{i}")
+                        y_axis = st.selectbox("Y Axis", numeric_cols if numeric_cols else all_cols, key=f"y_axis_{i}")
                     
                     # Generate chart based on selection
                     try:
@@ -329,24 +331,57 @@ if submitted and user_query.strip() and st.session_state.engine and st.session_s
         if st.session_state.llm_provider in ("Groq", "OpenAI") and not st.session_state.llm_api_key:
             raise ValueError(f"Please enter your {st.session_state.llm_provider} API key.")
         
+        # Check if there's a pending clarification to continue
+        pending = st.session_state.get("pending_clarification")
+        clarification_history = None
+        api_user_query = user_query
+
+        if pending:
+            # This submission is an answer to a pending clarification question
+            last_question = pending["last_question"]
+            clarification_history = [
+                *pending["history"],
+                {"question": last_question, "answer": user_query.strip()},
+            ]
+            api_user_query = pending["original_question"]
+
         # Get response from backend with selected tables and LLM config
         with st.spinner("Generating SQL and querying the database..."):
             result = ask_database(
-                user_query,
+                api_user_query,
                 db_engine=st.session_state.engine,
                 provider=st.session_state.llm_provider.lower(),
                 api_key=st.session_state.llm_api_key or None,
                 model=st.session_state.llm_model or None,
                 allowed_tables=set(st.session_state.selected_tables),
+                clarification_history=clarification_history,
             )
-        
-        # Add assistant response to chat
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": result["answer"],
-            "sql": result.get("sql"),
-            "result": result.get("result"),
-        })
+
+        # Handle clarification flow — store pending state so the next user
+        # submission is correctly appended to the conversation history.
+        if result["status"] == "needs_clarification":
+            st.session_state.pending_clarification = {
+                "original_question": api_user_query,
+                "history": clarification_history or [],
+                "last_question": result.get("clarification_question", result["answer"]),
+            }
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result["answer"],
+                "sql": None,
+                "result": None,
+                "is_clarification": True,
+            })
+        else:
+            # Clear any pending clarification
+            st.session_state.pending_clarification = None
+            # Add assistant response to chat
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result["answer"],
+                "sql": result.get("sql"),
+                "result": result.get("result"),
+            })
     except Exception as e:
         st.session_state.messages.append({
             "role": "assistant",
@@ -354,7 +389,8 @@ if submitted and user_query.strip() and st.session_state.engine and st.session_s
             "sql": None,
             "result": None,
         })
-    
+        st.session_state.pending_clarification = None
+
     # Rerun to display the new messages
     st.rerun()
 elif submitted and not user_query.strip():

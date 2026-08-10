@@ -165,6 +165,20 @@ Original user question:
 Clarification conversation so far:
 {clarification_history}
 
+CRITICAL INSTRUCTIONS - READ BEFORE DECIDING:
+1. Review the clarification conversation above. Any question that has already
+   been asked and answered is RESOLVED. Do NOT re-ask resolved questions.
+2. When a detail is not specified, use a sensible default:
+   - Time range: ALL TIME
+   - Store: ALL STORES
+   - Category: ALL CATEGORIES
+   - Other dimensions: the most inclusive option
+3. Only ask a clarification question if the missing information would
+   materially change the SQL query. For example, "top 5 films by rental
+   count" is sufficiently precise - default to all time and all stores.
+4. If the user has already answered a question, incorporate that answer
+   into the resolved query and move on.
+
 Decide whether the request is sufficiently precise to generate one SQL query.
 
 Use CLARIFY only when missing information would materially change the query,
@@ -176,7 +190,7 @@ Rules:
 - Offer 2-4 choices when that makes the question easier to answer.
 - Use READY when the request is sufficiently precise.
 - When READY, produce a complete standalone resolved_query incorporating all
-  clarification answers.
+  clarification answers and sensible defaults.
 - Use CANNOT_ANSWER only when the schema cannot answer the request.
 - Never generate SQL here.
 - Return valid JSON only. Do not use Markdown.
@@ -198,8 +212,29 @@ def _format_clarification_history(history: list[dict[str, str]]) -> str:
     lines: list[str] = []
     for index, turn in enumerate(history, start=1):
         lines.append(f"Round {index} assistant question: {turn.get('question', '')}")
-        lines.append(f"Round {index} user answer: {turn.get('answer', '')}")
+        lines.append(f"Round {index} user answer: {turn.get('answer', '')} (RESOLVED)")
     return "\n".join(lines)
+
+
+# Keywords that indicate the dimension being asked about in a clarification
+DIMENSION_KEYWORDS = {
+    "time": ["time", "period", "date", "year", "month", "day", "week", "range", "duration", "when"],
+    "store": ["store", "location", "branch", "shop"],
+    "category": ["category", "genre", "type", "kind"],
+    "customer": ["customer", "user", "client"],
+    "actor": ["actor", "person", "performer"],
+    "film": ["film", "movie", "title"],
+}
+
+
+def _detect_dimension(text: str) -> str | None:
+    """Detect which dimension a clarification question or answer is about."""
+    text_lower = text.lower()
+    for dimension, keywords in DIMENSION_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return dimension
+    return None
 
 
 def _parse_json_object(raw_content: str) -> dict[str, Any]:
@@ -238,6 +273,36 @@ def assess_clarity(
         raise ValueError("CLARIFY response did not contain a question.")
     if status == "READY" and not decision.get("resolved_query"):
         decision["resolved_query"] = original_question
+
+    # Post-processing: detect if the model is re-asking a question that has
+    # already been asked or answered in the history. If so, force READY to
+    # avoid infinite clarification loops.
+    if status == "CLARIFY" and history:
+        new_question = str(decision.get("question", "")).lower().strip()
+        if new_question:
+            new_dimension = _detect_dimension(new_question)
+            for turn in history:
+                asked = str(turn.get("question", "")).lower().strip()
+                answer = str(turn.get("answer", "")).lower().strip()
+
+                # Check if the new question is a repeat of a previously asked question
+                if asked and (new_question in asked or asked in new_question):
+                    decision["status"] = "READY"
+                    decision["resolved_query"] = original_question
+                    decision["question"] = None
+                    break
+
+                # Check if the new question is about a dimension that was
+                # already asked about or answered
+                if new_dimension:
+                    if (asked and _detect_dimension(asked) == new_dimension) or (
+                        answer and _detect_dimension(answer) == new_dimension
+                    ):
+                        decision["status"] = "READY"
+                        decision["resolved_query"] = original_question
+                        decision["question"] = None
+                        break
+
     return decision
 
 
@@ -487,21 +552,18 @@ def ask_database(
 
     if clarity["status"] == "CLARIFY":
         if len(history) >= MAX_CLARIFICATION_ROUNDS:
+            # Force READY with the original question to avoid infinite loops
+            clarity["status"] = "READY"
+            clarity["resolved_query"] = user_query
+            clarity["question"] = None
+        else:
+            clarification_question = str(clarity["question"])
             return _response(
-                status="cannot_answer",
+                status="needs_clarification",
                 question=user_query,
-                answer=(
-                    "I still do not have enough detail to answer safely. "
-                    "Please restate the request with the metric, filters, and time period."
-                ),
+                clarification_question=clarification_question,
+                answer=clarification_question,
             )
-        clarification_question = str(clarity["question"])
-        return _response(
-            status="needs_clarification",
-            question=user_query,
-            clarification_question=clarification_question,
-            answer=clarification_question,
-        )
 
     if clarity["status"] == "CANNOT_ANSWER":
         return _response(
