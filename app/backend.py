@@ -1,217 +1,352 @@
-"""
-Backend for the Natural Language → SQL pipeline.
+"""Natural-language to SQL backend with a multi-turn clarification engine.
 
-Implements the flow:
-User Query → Prompt Template (schema/rules) → Llama 3.1 → SQL Validator → SQLAlchemy → MySQL → Results → LLM (English answer) → User Response
+Flow:
+User question -> clarification engine -> SQL generation -> validation ->
+MySQL execution -> natural-language answer.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import re
+from typing import Any
 from urllib.parse import quote_plus
 
 import pandas as pd
 import sqlparse
-from sqlalchemy import create_engine, inspect, text
-
 from langchain_core.prompts import ChatPromptTemplate
+from sqlalchemy import Engine, create_engine, inspect, text
+
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
 
-# --- MySQL connection (override via environment variables) ---
-DB_USER = os.getenv("DB_USER", "sql_agent")
-DB_PASSWORD = quote_plus(os.getenv("DB_PASSWORD", "Delhi@369"))
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME", "sakila")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# --- LLM provider: "groq" or "ollama" ---
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
+MAX_CLARIFICATION_ROUNDS = int(os.getenv("MAX_CLARIFICATION_ROUNDS", "3"))
+MAX_RESULT_ROWS_FOR_LLM = int(os.getenv("MAX_RESULT_ROWS_FOR_LLM", "200"))
 
-# Only needed if LLM_PROVIDER == "groq"
-os.environ.setdefault("GROQ_API_KEY", os.getenv("GROQ_API_KEY", "your_groq_api_key"))
-
-# Tables the LLM is allowed to query (used by both the prompt and the validator)
 ALLOWED_TABLES = {
-    "film", "film_category", "category", "film_actor", "actor",
-    "inventory", "rental", "payment", "customer", "store", "staff",
-    "address", "city", "country",
+    "film",
+    "film_category",
+    "category",
+    "film_actor",
+    "actor",
+    "inventory",
+    "rental",
+    "payment",
+    "customer",
+    "store",
+    "staff",
+    "address",
+    "city",
+    "country",
 }
 
-DATABASE_URL = (
-    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-)
 
-engine = create_engine(DATABASE_URL)
+def create_db_engine(
+    db_user: str,
+    db_password: str,
+    db_host: str,
+    db_port: str,
+    db_name: str,
+) -> Engine:
+    """Create a SQLAlchemy engine from explicit database credentials."""
+    db_password_escaped = quote_plus(db_password)
+    database_url = (
+        f"mysql+pymysql://{db_user}:{db_password_escaped}@"
+        f"{db_host}:{db_port}/{db_name}"
+    )
+    return create_engine(database_url, pool_pre_ping=True)
+
+
+# ---------------------------------------------------------------------------
+# LLM
+# ---------------------------------------------------------------------------
+
+if LLM_PROVIDER == "groq":
+    from langchain_groq import ChatGroq
+
+    if not os.getenv("GROQ_API_KEY"):
+        raise RuntimeError("GROQ_API_KEY must be set when LLM_PROVIDER=groq.")
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+elif LLM_PROVIDER == "ollama":
+    from langchain_ollama import ChatOllama
+
+    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0)
+else:
+    raise ValueError("LLM_PROVIDER must be either 'groq' or 'ollama'.")
 
 
 # ---------------------------------------------------------------------------
 # Schema introspection
 # ---------------------------------------------------------------------------
 
-def get_schema_info(engine, allowed_tables):
-    inspector = inspect(engine)
-    schema_lines = []
+def get_schema_info(db_engine: Engine, allowed_tables: set[str]) -> str:
+    """Return columns and foreign keys for tables the model may query."""
+    inspector = inspect(db_engine)
+    available_tables = set(inspector.get_table_names())
+    schema_lines: list[str] = []
 
-    for table in inspector.get_table_names():
-        if table not in allowed_tables:
-            continue
-
-        cols = inspector.get_columns(table)
-        col_desc = ", ".join(
-            f"{c['name']} ({c['type']})" for c in cols
+    for table_name in sorted(available_tables & allowed_tables):
+        columns = inspector.get_columns(table_name)
+        column_description = ", ".join(
+            f"{column['name']} ({column['type']})" for column in columns
         )
-        schema_lines.append(f"Table `{table}`: {col_desc}")
+        schema_lines.append(f"Table `{table_name}`: {column_description}")
 
-        for fk in inspector.get_foreign_keys(table):
+        for foreign_key in inspector.get_foreign_keys(table_name):
+            local_columns = ", ".join(foreign_key["constrained_columns"])
+            remote_columns = ", ".join(foreign_key["referred_columns"])
             schema_lines.append(
-                f"FK: {table}.{fk['constrained_columns']} -> "
-                f"{fk['referred_table']}.{fk['referred_columns']}"
+                f"FK: {table_name}.({local_columns}) -> "
+                f"{foreign_key['referred_table']}.({remote_columns})"
             )
 
     return "\n".join(schema_lines)
 
 
 # ---------------------------------------------------------------------------
-# Prompt template (LangChain)
+# Clarification engine
 # ---------------------------------------------------------------------------
 
-SQL_RULES = """
+clarification_prompt = ChatPromptTemplate.from_template(
+    """You are the clarification stage of a natural-language database assistant.
+
+Available schema:
+{schema_info}
+
+Original user question:
+{original_question}
+
+Clarification conversation so far:
+{clarification_history}
+
+Decide whether the request is sufficiently precise to generate one SQL query.
+
+Use CLARIFY only when missing information would materially change the query,
+such as an ambiguous metric, entity, time range, grouping, ranking, or words
+like "best", "top", "recent", and "active". Do not ask unnecessary questions.
+
 Rules:
-- Only use tables from the schema provided below.
-- Only generate SELECT statements. Never write INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
-- Always use explicit JOINs based on the foreign key relationships given.
-- Return ONLY the raw SQL query. No explanation, no markdown code fences.
-- If the question cannot be answered with the given schema, return exactly: CANNOT_ANSWER
+- Ask exactly one short, specific question at a time.
+- Offer 2-4 choices when that makes the question easier to answer.
+- Use READY when the request is sufficiently precise.
+- When READY, produce a complete standalone resolved_query incorporating all
+  clarification answers.
+- Use CANNOT_ANSWER only when the schema cannot answer the request.
+- Never generate SQL here.
+- Return valid JSON only. Do not use Markdown.
+
+JSON format:
+{{
+  "status": "READY" | "CLARIFY" | "CANNOT_ANSWER",
+  "question": null | "one user-facing clarification question",
+  "resolved_query": null | "complete standalone question",
+  "reason": "brief internal reason"
+}}"""
+)
+
+clarification_chain = clarification_prompt | llm
+
+
+def _format_clarification_history(history: list[dict[str, str]]) -> str:
+    if not history:
+        return "No clarification questions have been asked."
+
+    lines: list[str] = []
+    for index, turn in enumerate(history, start=1):
+        lines.append(f"Round {index} assistant question: {turn.get('question', '')}")
+        lines.append(f"Round {index} user answer: {turn.get('answer', '')}")
+    return "\n".join(lines)
+
+
+def _parse_json_object(raw_content: str) -> dict[str, Any]:
+    """Parse a JSON object even if the model accidentally adds code fences."""
+    cleaned = raw_content.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        raise ValueError("The clarification model did not return a JSON object.")
+    return json.loads(match.group(0))
+
+
+def assess_clarity(
+    original_question: str,
+    schema_info: str,
+    clarification_history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    history = clarification_history or []
+    response = clarification_chain.invoke(
+        {
+            "schema_info": schema_info,
+            "original_question": original_question,
+            "clarification_history": _format_clarification_history(history),
+        }
+    )
+    decision = _parse_json_object(response.content)
+
+    status = str(decision.get("status", "")).upper()
+    if status not in {"READY", "CLARIFY", "CANNOT_ANSWER"}:
+        raise ValueError(f"Invalid clarification status: {status or 'missing'}")
+
+    decision["status"] = status
+    if status == "CLARIFY" and not decision.get("question"):
+        raise ValueError("CLARIFY response did not contain a question.")
+    if status == "READY" and not decision.get("resolved_query"):
+        decision["resolved_query"] = original_question
+    return decision
+
+
+# ---------------------------------------------------------------------------
+# SQL generation
+# ---------------------------------------------------------------------------
+
+SQL_RULES = """Rules:
+- Use only tables and columns in the supplied schema.
+- Generate exactly one SELECT statement.
+- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE,
+  GRANT, REVOKE, EXEC, or EXECUTE.
+- Use explicit JOINs based on the supplied foreign-key relationships.
+- Prefer qualified column names when multiple tables are used.
+- Do not use common table expressions (WITH clauses).
+- Return only raw SQL, without explanations or Markdown fences.
+- If the request cannot be answered from the schema, return CANNOT_ANSWER.
 """
 
 sql_prompt = ChatPromptTemplate.from_template(
-    """You are a MySQL expert. Convert the user's question into a single SQL query.
+    """You are a MySQL expert. Convert the resolved user request into SQL.
 
 Schema:
 {schema_info}
 
 {sql_rules}
 
-User question: {user_query}
+Resolved user request:
+{user_query}
 
-SQL query:"""
+SQL:"""
 )
-
-
-# ---------------------------------------------------------------------------
-# LLM (Llama 3.1)
-# ---------------------------------------------------------------------------
-
-if LLM_PROVIDER == "groq":
-    from langchain_groq import ChatGroq
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-elif LLM_PROVIDER == "ollama":
-    from langchain_ollama import ChatOllama
-    llm = ChatOllama(model="qwen3:8b", temperature=0)
-else:
-    raise ValueError("LLM_PROVIDER must be 'groq' or 'ollama'")
 
 sql_chain = sql_prompt | llm
 
 
 def generate_sql(user_query: str, schema_info: str) -> str:
-    response = sql_chain.invoke({
-        "schema_info": schema_info,
-        "sql_rules": SQL_RULES,
-        "user_query": user_query,
-    })
+    response = sql_chain.invoke(
+        {
+            "schema_info": schema_info,
+            "sql_rules": SQL_RULES,
+            "user_query": user_query,
+        }
+    )
     sql = response.content.strip()
-    # Strip accidental markdown fences
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    return sql
+    sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\s*```$", "", sql)
+    return sql.strip()
 
 
 # ---------------------------------------------------------------------------
-# SQL Validator Layer
+# SQL validation
 # ---------------------------------------------------------------------------
 
 FORBIDDEN_KEYWORDS = {
-    "DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
-    "TRUNCATE", "CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE",
+    "DROP",
+    "DELETE",
+    "UPDATE",
+    "INSERT",
+    "ALTER",
+    "TRUNCATE",
+    "CREATE",
+    "GRANT",
+    "REVOKE",
+    "EXEC",
+    "EXECUTE",
 }
 
 
 class SQLValidationError(Exception):
-    pass
+    """Raised when generated SQL violates a safety rule."""
 
 
-def validate_sql(sql: str, allowed_tables: set) -> str:
-    if not sql or sql.strip().upper() == "CANNOT_ANSWER":
-        raise SQLValidationError("Model could not translate the question into SQL.")
+def validate_sql(sql: str, allowed_tables: set[str]) -> str:
+    normalized = sql.strip()
+    if not normalized or normalized.upper() == "CANNOT_ANSWER":
+        raise SQLValidationError("The model could not translate the request into SQL.")
 
-    # 1. Syntax check
-    parsed = sqlparse.parse(sql)
+    split_statements = [item for item in sqlparse.split(normalized) if item.strip()]
+    if len(split_statements) != 1:
+        raise SQLValidationError("Exactly one SQL statement is allowed.")
+
+    parsed = sqlparse.parse(normalized)
     if not parsed or not parsed[0].tokens:
-        raise SQLValidationError("Could not parse SQL — invalid syntax.")
+        raise SQLValidationError("The generated SQL could not be parsed.")
 
-    statement = parsed[0]
-    stmt_type = statement.get_type()
+    statement_type = parsed[0].get_type()
+    if statement_type != "SELECT":
+        raise SQLValidationError(
+            f"Only SELECT statements are allowed; received {statement_type}."
+        )
 
-    # 2. SELECT-only check
-    if stmt_type != "SELECT":
-        raise SQLValidationError(f"Only SELECT statements are allowed, got: {stmt_type}")
+    for keyword in FORBIDDEN_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", normalized, re.IGNORECASE):
+            raise SQLValidationError(f"Forbidden SQL keyword detected: {keyword}")
 
-    # 3. Forbidden keyword check (defense in depth beyond stmt_type)
-    tokens_upper = sql.upper()
-    for kw in FORBIDDEN_KEYWORDS:
-        if re.search(rf"\b{kw}\b", tokens_upper):
-            raise SQLValidationError(f"Forbidden keyword detected: {kw}")
+    referenced_tables = {
+        table_name.lower()
+        for table_name in re.findall(
+            r"(?:FROM|JOIN)\s+(?:`?\w+`?\.)?`?([A-Za-z_][A-Za-z0-9_]*)`?",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    }
+    disallowed_tables = referenced_tables - {name.lower() for name in allowed_tables}
+    if disallowed_tables:
+        raise SQLValidationError(
+            f"Query references disallowed tables: {sorted(disallowed_tables)}"
+        )
 
-    # 4. Allowed-tables check
-    referenced_tables = set(re.findall(r"(?:FROM|JOIN)\s+`?(\w+)`?", sql, re.IGNORECASE))
-    disallowed = referenced_tables - allowed_tables
-    if disallowed:
-        raise SQLValidationError(f"Query references disallowed table(s): {disallowed}")
-
-    # 5. Single statement only (no stacked queries)
-    if len(sqlparse.split(sql)) > 1:
-        raise SQLValidationError("Multiple statements are not allowed.")
-
-    return sql
-
-
-# ---------------------------------------------------------------------------
-# Execute query (SQLAlchemy → MySQL)
-# ---------------------------------------------------------------------------
-
-def run_query(engine, sql: str) -> pd.DataFrame:
-    with engine.connect() as conn:
-        result = conn.execute(text(sql))
-        rows = result.fetchall()
-        columns = result.keys()
-    return pd.DataFrame(rows, columns=columns)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
-# LLM converts results into an English answer
+# Query execution and answer generation
 # ---------------------------------------------------------------------------
+
+def run_query(db_engine: Engine, sql: str) -> pd.DataFrame:
+    with db_engine.connect() as connection:
+        result = connection.execute(text(sql))
+        return pd.DataFrame(result.fetchall(), columns=result.keys())
+
 
 answer_prompt = ChatPromptTemplate.from_template(
-    """The user asked: "{user_query}"
+    """The user asked:
+{user_query}
 
-The SQL query below was run and returned this data (as a table):
+The retrieved data is:
 {query_result}
 
-Write a concise, natural-language answer to the user's question based only on this data.
-Do not mention SQL or databases in your answer."""
+Answer the user's question concisely using only the retrieved data.
+Do not mention SQL, tables, schemas, or databases. If there are no rows, say
+that no matching information was found. Do not invent missing information."""
 )
 
 answer_chain = answer_prompt | llm
 
 
-def explain_results(user_query: str, df: pd.DataFrame) -> str:
-    result_str = df.to_string(index=False) if not df.empty else "No rows returned."
-    response = answer_chain.invoke({
-        "user_query": user_query,
-        "query_result": result_str,
-    })
+def explain_results(user_query: str, dataframe: pd.DataFrame) -> str:
+    limited = dataframe.head(MAX_RESULT_ROWS_FOR_LLM)
+    result_text = limited.to_string(index=False) if not limited.empty else "No rows returned."
+    if len(dataframe) > len(limited):
+        result_text += f"\nShowing {len(limited)} of {len(dataframe)} returned rows."
+
+    response = answer_chain.invoke(
+        {"user_query": user_query, "query_result": result_text}
+    )
     return response.content.strip()
 
 
@@ -219,83 +354,155 @@ def explain_results(user_query: str, df: pd.DataFrame) -> str:
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def ask_database(user_query: str, retries: int = 1, allowed_tables: set | None = None):
-    """
-    Full pipeline: NL question -> SQL -> validate -> execute -> NL answer.
-    Retries once with the LLM if validation or execution fails.
-    
-    Args:
-        user_query: Natural language question
-        retries: Number of retries on failure
-        allowed_tables: Set of table names the LLM can query. If None, uses global ALLOWED_TABLES
-    """
-    # Use provided allowed_tables or fall back to global
-    tables = allowed_tables if allowed_tables is not None else ALLOWED_TABLES
-    
-    # Get schema info for the selected tables
-    try:
-        current_schema_info = get_schema_info(engine, tables)
-    except Exception as e:
-        return {
-            "question": user_query,
-            "sql": None,
-            "result": None,
-            "answer": f"Sorry, could not retrieve schema information: {str(e)}",
-        }
-    
-    if current_schema_info is None or current_schema_info == "":
-        return {
-            "question": user_query,
-            "sql": None,
-            "result": None,
-            "answer": "Sorry, schema information is not available. Please check your database connection.",
-        }
-
-    last_error = None
-    for attempt in range(retries + 1):
-        try:
-            sql = generate_sql(user_query, current_schema_info)
-            sql = validate_sql(sql, tables)
-            df = run_query(engine, sql)
-            answer = explain_results(user_query, df)
-            return {
-                "question": user_query,
-                "sql": sql,
-                "result": df,
-                "answer": answer,
-            }
-        except SQLValidationError as e:
-            last_error = e
-            # Don't retry validation errors - they won't improve
-            break
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                continue
-            break
-    
-    error_msg = str(last_error) if last_error else "Unknown error occurred"
+def _response(
+    *,
+    status: str,
+    question: str,
+    answer: str,
+    resolved_query: str | None = None,
+    clarification_question: str | None = None,
+    sql: str | None = None,
+    result: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     return {
-        "question": user_query,
-        "sql": None,
-        "result": None,
-        "answer": f"Sorry, I couldn't answer that. ({error_msg})",
+        "status": status,
+        "question": question,
+        "resolved_query": resolved_query,
+        "clarification_question": clarification_question,
+        "sql": sql,
+        "result": result,
+        "answer": answer,
     }
 
 
-# ---------------------------------------------------------------------------
-# Initialize schema info at import time
-# ---------------------------------------------------------------------------
+def ask_database(
+    user_query: str,
+    db_engine: Engine,
+    retries: int = 1,
+    allowed_tables: set[str] | None = None,
+    clarification_history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Run clarification first and execute SQL only when the request is ready.
 
-try:
-    with engine.connect() as conn:
-        print("✅ Connected to MySQL")
-        print(conn.execute(text("SELECT DATABASE();")).fetchone())
+    Each clarification history item must look like:
+    {"question": "Question previously shown to the user", "answer": "User reply"}
+    """
+    user_query = user_query.strip()
+    history = clarification_history or []
+    tables = set(allowed_tables or ALLOWED_TABLES)
 
-    schema_info = get_schema_info(engine, ALLOWED_TABLES)
-    print(schema_info)
+    if not user_query:
+        return _response(
+            status="error",
+            question=user_query,
+            answer="Please enter a question.",
+        )
 
-except Exception as e:
-    print(f"⚠️  Could not connect to database: {e}")
-    schema_info = None
-    raise RuntimeError(f"Failed to initialize database connection and schema: {e}") from e
+    try:
+        current_schema_info = get_schema_info(db_engine, tables)
+    except Exception as exc:
+        return _response(
+            status="error",
+            question=user_query,
+            answer=f"Could not retrieve schema information: {exc}",
+        )
+
+    if not current_schema_info:
+        return _response(
+            status="error",
+            question=user_query,
+            answer="No permitted database schema is available.",
+        )
+
+    try:
+        clarity = assess_clarity(user_query, current_schema_info, history)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _response(
+            status="error",
+            question=user_query,
+            answer=f"Could not assess the request clearly: {exc}",
+        )
+
+    if clarity["status"] == "CLARIFY":
+        if len(history) >= MAX_CLARIFICATION_ROUNDS:
+            return _response(
+                status="cannot_answer",
+                question=user_query,
+                answer=(
+                    "I still do not have enough detail to answer safely. "
+                    "Please restate the request with the metric, filters, and time period."
+                ),
+            )
+        clarification_question = str(clarity["question"])
+        return _response(
+            status="needs_clarification",
+            question=user_query,
+            clarification_question=clarification_question,
+            answer=clarification_question,
+        )
+
+    if clarity["status"] == "CANNOT_ANSWER":
+        return _response(
+            status="cannot_answer",
+            question=user_query,
+            answer="I cannot answer that from the available information.",
+        )
+
+    resolved_query = str(clarity.get("resolved_query") or user_query).strip()
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        try:
+            sql = generate_sql(resolved_query, current_schema_info)
+            validated_sql = validate_sql(sql, tables)
+            dataframe = run_query(db_engine, validated_sql)
+            answer = explain_results(resolved_query, dataframe)
+            return _response(
+                status="complete",
+                question=user_query,
+                resolved_query=resolved_query,
+                sql=validated_sql,
+                result=dataframe,
+                answer=answer,
+            )
+        except SQLValidationError as exc:
+            last_error = exc
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+
+    return _response(
+        status="error",
+        question=user_query,
+        resolved_query=resolved_query,
+        answer=f"I could not answer the request: {last_error or 'unknown error'}",
+    )
+
+
+def continue_after_clarification(
+    original_question: str,
+    previous_history: list[dict[str, str]],
+    clarification_question: str,
+    user_answer: str,
+    db_engine: Engine,
+    **ask_options: Any,
+) -> dict[str, Any]:
+    """Convenience helper for submitting the user's next clarification reply."""
+    updated_history = [
+        *previous_history,
+        {"question": clarification_question, "answer": user_answer.strip()},
+    ]
+    return ask_database(
+        original_question,
+        db_engine=db_engine,
+        clarification_history=updated_history,
+        **ask_options,
+    )
+
+
+def check_database_connection(db_engine: Engine) -> None:
+    """Optional startup health check; call this from the application startup hook."""
+    with db_engine.connect() as connection:
+        connection.execute(text("SELECT 1"))

@@ -10,7 +10,7 @@ import sys
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import inspect
 
 try:
     import graphviz
@@ -58,6 +58,7 @@ def create_er_diagram(engine, selected_tables):
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.backend import ask_database, get_schema_info, ALLOWED_TABLES as DEFAULT_ALLOWED_TABLES  # noqa: E402
+from app.backend import create_db_engine  # noqa: E402
 
 st.set_page_config(
     page_title="LLM based Analytics Assistant",
@@ -95,12 +96,8 @@ if "selected_tables" not in st.session_state:
 # Handle connection
 if connect_button:
     try:
-        from urllib.parse import quote_plus
-        db_password_escaped = quote_plus(db_password)
-        database_url = f"mysql+pymysql://{db_user}:{db_password_escaped}@{db_host}:{db_port}/{db_name}"
-        
         with st.spinner("Connecting to database..."):
-            engine = create_engine(database_url)
+            engine = create_db_engine(db_user, db_password, db_host, db_port, db_name)
             # Test connection
             with engine.connect() as conn:
                 from sqlalchemy import text
@@ -264,7 +261,11 @@ if submitted and user_query.strip() and st.session_state.engine and st.session_s
         
         # Get response from backend with selected tables
         with st.spinner("Generating SQL and querying the database..."):
-            result = ask_database(user_query, allowed_tables=set(st.session_state.selected_tables))
+            result = ask_database(
+                user_query,
+                db_engine=st.session_state.engine,
+                allowed_tables=set(st.session_state.selected_tables),
+            )
         
         # Add assistant response to chat
         st.session_state.messages.append({
